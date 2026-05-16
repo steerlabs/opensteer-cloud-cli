@@ -1,11 +1,11 @@
 ---
 name: opensteer-cloud
-description: Use when the user wants to attach a local coding agent to an OpenSteer Cloud sandbox and operate the sandbox through `opensteer-run` commands and file primitives. Do not use for in-sandbox browser automation; that is the `opensteer` skill.
+description: Use when the user wants to attach a local coding agent to an Opensteer Cloud sandbox and operate the sandbox through `opensteer-run` commands and file primitives. Do not use for in-sandbox browser automation; that is the `opensteer` skill.
 ---
 
-# OpenSteer Cloud CLI
+# Opensteer Cloud CLI
 
-Drive an OpenSteer Cloud sandbox from a local coding agent. The sandbox is the
+Drive an Opensteer Cloud sandbox from a local coding agent. The sandbox is the
 source of truth for files, credentials, browser state, packages, scheduled jobs,
 SQLite databases, logs, and artifacts.
 

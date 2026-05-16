@@ -9,7 +9,6 @@ use reqwest::{Response, StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
-    collections::HashSet,
     fs::{self, File, OpenOptions},
     io::{ErrorKind, IsTerminal, Read, Write},
     path::{Path, PathBuf},
@@ -19,13 +18,15 @@ use tempfile::NamedTempFile;
 use thiserror::Error;
 use tokio::sync::Mutex;
 
-const DEFAULT_BASE_URL: &str = "http://localhost:3001";
-const TEMPLATE_DESCRIPTOR_PATH: &str = ".opensteer/template.json";
+const DEFAULT_BASE_URL: &str = "https://opensteer.com";
 const ACCESS_TOKEN_LEEWAY_SECS: u64 = 30;
+const CONNECTION_DIR_NAME: &str = ".opensteer-cloud";
+const CONNECTION_FILE_NAME: &str = "connection.json";
 
 #[derive(Parser)]
 #[command(name = "opensteer-cloud")]
-#[command(about = "OpenSteer Cloud control-plane CLI")]
+#[command(about = "Opensteer Cloud control-plane CLI")]
+#[command(version)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -39,10 +40,6 @@ enum Commands {
     Attach {
         agent: String,
     },
-    Browser {
-        #[command(subcommand)]
-        command: BrowserCommands,
-    },
     Profiles {
         #[command(subcommand)]
         command: browser_profiles::ProfileCommands,
@@ -50,10 +47,6 @@ enum Commands {
     Agent {
         #[command(subcommand)]
         command: AgentCommands,
-    },
-    Templates {
-        #[command(subcommand)]
-        command: TemplateCommands,
     },
 }
 
@@ -63,21 +56,6 @@ enum AgentCommands {
     List,
     Open { agent: String },
     Rm { agent: String },
-}
-
-#[derive(Subcommand)]
-enum BrowserCommands {
-    Open { agent: String, url: String },
-    Save { agent: String },
-    Close { agent: String },
-    Focus { agent: String },
-}
-
-#[derive(Subcommand)]
-enum TemplateCommands {
-    Search { query: Vec<String> },
-    Inspect { id: String },
-    Apply { id: String },
 }
 
 #[tokio::main]
@@ -93,23 +71,12 @@ async fn main() -> Result<()> {
         Commands::Logout => logout().await,
         Commands::Whoami => whoami().await,
         Commands::Attach { agent } => attach(&agent).await,
-        Commands::Browser { command } => match command {
-            BrowserCommands::Open { agent, url } => browser_open(&agent, &url).await,
-            BrowserCommands::Save { agent } => browser_save(&agent).await,
-            BrowserCommands::Close { agent } => browser_close(&agent).await,
-            BrowserCommands::Focus { agent } => agent_open(&agent).await,
-        },
         Commands::Profiles { command } => profiles(command).await,
         Commands::Agent { command } => match command {
             AgentCommands::Create { prompt } => agent_create(&prompt.join(" ")).await,
             AgentCommands::List => agent_list().await,
             AgentCommands::Open { agent } => agent_open(&agent).await,
             AgentCommands::Rm { agent } => agent_rm(&agent).await,
-        },
-        Commands::Templates { command } => match command {
-            TemplateCommands::Search { query } => template_search(&query.join(" ")),
-            TemplateCommands::Inspect { id } => template_inspect(&id),
-            TemplateCommands::Apply { id } => template_apply(&id),
         },
     }
 }
@@ -138,7 +105,7 @@ async fn login() -> Result<()> {
         .json()
         .await?;
 
-    println!("Open this URL to authorize OpenSteer Cloud:");
+    println!("Open this URL to authorize Opensteer Cloud:");
     println!("{}", start.verification_uri_complete);
     println!("Code: {}", start.user_code);
     let _ = open::that(&start.verification_uri_complete);
@@ -205,8 +172,9 @@ async fn logout() -> Result<()> {
             .await;
     }
     auth.clear().await?;
-    let connection = ConnectionStore::open()?;
-    connection.clear().await?;
+    if let Some(connection) = ConnectionStore::find_existing_for_current_dir()? {
+        connection.clear().await?;
+    }
     println!("Logged out.");
     Ok(())
 }
@@ -270,102 +238,56 @@ async fn agent_rm(agent: &str) -> Result<()> {
     Ok(())
 }
 
-async fn browser_open(agent: &str, url: &str) -> Result<()> {
+async fn attach(agent_selector: &str) -> Result<()> {
     let auth = AuthStore::open()?;
-    let agent = resolve_agent(&auth, agent).await?;
-    let response: Value = api_post(
+    let agent = resolve_agent(&auth, agent_selector).await?;
+    let response: WorkspaceConnectResponse = api_post(
         &auth,
-        &format!("/api/agents/{}/browser/open", agent.id),
-        &json!({
-            "url": url,
-            "reveal": true,
-        }),
-    )
-    .await?;
-    let ui_url = format!("{}/agents/{}", auth.base_url(), agent.id);
-    let _ = open::that(&ui_url);
-    println!("Opened browser for {}.", agent.name);
-    if let Some(session_id) = response.get("sessionId").and_then(Value::as_str) {
-        println!("session: {session_id}");
-    }
-    println!("agent UI: {ui_url}");
-    Ok(())
-}
-
-async fn browser_save(agent: &str) -> Result<()> {
-    let auth = AuthStore::open()?;
-    let agent = resolve_agent(&auth, agent).await?;
-    let response: Value = api_post(
-        &auth,
-        &format!("/api/agents/{}/browser/save", agent.id),
+        &format!("/api/agents/{}/workspace/connect", agent.id),
         &json!({}),
     )
     .await?;
-    println!("Saved browser profile for {}.", agent.name);
-    if let Some(session_id) = response.get("sessionId").and_then(Value::as_str) {
-        println!("session: {session_id}");
-    }
-    Ok(())
-}
-
-async fn browser_close(agent: &str) -> Result<()> {
-    let auth = AuthStore::open()?;
-    let agent = resolve_agent(&auth, agent).await?;
-    api_delete(&auth, &format!("/api/agents/{}/browser/session", agent.id)).await?;
-    println!("Closed browser for {}.", agent.name);
-    Ok(())
-}
-
-async fn attach(agent_selector: &str) -> Result<()> {
-    let auth = AuthStore::open()?;
-    let connection_store = ConnectionStore::open()?;
-    let agent = resolve_agent(&auth, agent_selector).await?;
-    let response: WorkspaceBootstrapResponse =
-        api_get(&auth, &format!("/api/agents/{}/workspace", agent.id)).await?;
+    let workspace_path = response.workspace.path;
+    let connection_store = ConnectionStore::open_for_current_dir()?;
     connection_store
         .set(ActiveConnection {
+            version: 1,
+            base_url: auth.base_url().to_string(),
             cloud_agent_id: agent.id.clone(),
             cloud_agent_name: agent.name.clone(),
-            workspace_id: response
-                .workspace
-                .as_ref()
-                .map(|workspace| workspace.id.clone()),
-            sandbox_id: response
-                .workspace
-                .as_ref()
-                .and_then(|workspace| workspace.sandbox_id.clone()),
+            workspace_path: workspace_path.clone(),
             attached_at: now_secs(),
         })
         .await?;
-    let agent_url = format!("{}/agents/{}", auth.base_url(), agent.id);
-    let _ = open::that(&agent_url);
-    println!("Attached to {}.", agent.name);
-    println!("Agent UI: {agent_url}");
-    println!("Sandbox workspace is now the source of truth.");
-    println!(
-        "Use opensteer-run for every sandbox command, file read, file write, search, and patch."
-    );
-    println!("Do not cd into a local mirror; no local sandbox workspace is required.");
-    println!("Examples:");
-    println!("  opensteer-run ls .");
-    println!("  opensteer-run read skills/SKILL.md");
-    println!("  opensteer-run \"python actions/job.py\"");
-    println!("  opensteer-run patch < change.diff");
+    println!("Attached to {} ({})", agent.name, agent.id);
+    println!("Workspace: {workspace_path}");
+    println!("Run: opensteer-run ls .");
     Ok(())
 }
 
 async fn opensteer_run() -> Result<i32> {
-    let connection_store = ConnectionStore::open()?;
-    let connection = connection_store
-        .get()
-        .await?
-        .ok_or_else(|| anyhow!("no active sandbox; run opensteer-cloud attach <agent>"))?;
-    let auth = AuthStore::open()?;
     let args = std::env::args().skip(1).collect::<Vec<_>>();
     if args.is_empty() {
         print_opensteer_run_usage();
         return Ok(2);
     }
+    if matches!(args[0].as_str(), "help" | "--help" | "-h") {
+        print_opensteer_run_usage();
+        return Ok(0);
+    }
+    if matches!(args[0].as_str(), "--version" | "-V") {
+        println!("opensteer-run {}", env!("CARGO_PKG_VERSION"));
+        return Ok(0);
+    }
+
+    let connection_store = ConnectionStore::find_existing_for_current_dir()?
+        .ok_or_else(|| anyhow!("no attached agent; run opensteer-cloud attach <agent>"))?;
+    let connection = connection_store
+        .get()
+        .await?
+        .ok_or_else(|| anyhow!("no attached agent; run opensteer-cloud attach <agent>"))?;
+    let auth = AuthStore::open()?;
+    ensure_auth_matches_connection(&auth, &connection)?;
 
     match args[0].as_str() {
         "exec" => {
@@ -413,12 +335,19 @@ async fn opensteer_run() -> Result<i32> {
             let command = build_rg_command(pattern, paths);
             run_exec_command(&auth, &connection, &command).await
         }
-        "help" | "--help" | "-h" => {
-            print_opensteer_run_usage();
-            Ok(0)
-        }
         _ => run_exec_command(&auth, &connection, &args.join(" ")).await,
     }
+}
+
+fn ensure_auth_matches_connection(auth: &AuthStore, connection: &ActiveConnection) -> Result<()> {
+    let auth_base_url = auth.base_url().trim_end_matches('/');
+    let connection_base_url = connection.base_url.trim_end_matches('/');
+    if auth_base_url != connection_base_url {
+        return Err(anyhow!(
+            "attached agent belongs to {connection_base_url}, but current login targets {auth_base_url}; run `opensteer-cloud attach <agent>` from this directory again"
+        ));
+    }
+    Ok(())
 }
 
 async fn run_exec_command(
@@ -432,7 +361,6 @@ async fn run_exec_command(
     let stdin_base64 = read_piped_stdin_base64()?;
     let mut body = json!({
         "command": command,
-        "injectProviderApiKeys": false,
     });
     if let Some(stdin_base64) = stdin_base64 {
         body["stdinBase64"] = Value::String(stdin_base64);
@@ -440,7 +368,7 @@ async fn run_exec_command(
 
     let response = api_post_response(
         auth,
-        &format!("/api/agents/{}/run/exec", connection.cloud_agent_id),
+        &format!("/api/agents/{}/workspace/exec", connection.cloud_agent_id),
         &body,
     )
     .await?;
@@ -450,7 +378,10 @@ async fn run_exec_command(
 async fn run_read_file(auth: &AuthStore, connection: &ActiveConnection, path: &str) -> Result<i32> {
     let file: RunFileReadResponse = api_post(
         auth,
-        &format!("/api/agents/{}/run/files/read", connection.cloud_agent_id),
+        &format!(
+            "/api/agents/{}/workspace/files/read",
+            connection.cloud_agent_id
+        ),
         &json!({ "path": path }),
     )
     .await?;
@@ -472,7 +403,10 @@ async fn run_write_file(
     let content_base64 = base64::engine::general_purpose::STANDARD.encode(bytes);
     let _: RunMutationResponse = api_post(
         auth,
-        &format!("/api/agents/{}/run/files/write", connection.cloud_agent_id),
+        &format!(
+            "/api/agents/{}/workspace/files/write",
+            connection.cloud_agent_id
+        ),
         &json!({
             "path": path,
             "contentBase64": content_base64,
@@ -490,7 +424,10 @@ async fn run_list_files(
 ) -> Result<i32> {
     let list: RunFileListResponse = api_post(
         auth,
-        &format!("/api/agents/{}/run/files/list", connection.cloud_agent_id),
+        &format!(
+            "/api/agents/{}/workspace/files/list",
+            connection.cloud_agent_id
+        ),
         &json!({ "path": path }),
     )
     .await?;
@@ -508,7 +445,10 @@ async fn run_list_files(
 async fn run_stat_path(auth: &AuthStore, connection: &ActiveConnection, path: &str) -> Result<i32> {
     let stat: Value = api_post(
         auth,
-        &format!("/api/agents/{}/run/files/stat", connection.cloud_agent_id),
+        &format!(
+            "/api/agents/{}/workspace/files/stat",
+            connection.cloud_agent_id
+        ),
         &json!({ "path": path }),
     )
     .await?;
@@ -519,7 +459,10 @@ async fn run_stat_path(auth: &AuthStore, connection: &ActiveConnection, path: &s
 async fn run_mkdir(auth: &AuthStore, connection: &ActiveConnection, path: &str) -> Result<i32> {
     let _: RunMutationResponse = api_post(
         auth,
-        &format!("/api/agents/{}/run/files/mkdir", connection.cloud_agent_id),
+        &format!(
+            "/api/agents/{}/workspace/files/mkdir",
+            connection.cloud_agent_id
+        ),
         &json!({ "path": path }),
     )
     .await?;
@@ -534,7 +477,10 @@ async fn run_rm(
 ) -> Result<i32> {
     let _: RunMutationResponse = api_post(
         auth,
-        &format!("/api/agents/{}/run/files/rm", connection.cloud_agent_id),
+        &format!(
+            "/api/agents/{}/workspace/files/rm",
+            connection.cloud_agent_id
+        ),
         &json!({ "path": path, "recursive": recursive }),
     )
     .await?;
@@ -551,7 +497,10 @@ async fn run_patch(auth: &AuthStore, connection: &ActiveConnection) -> Result<i3
     }
     let result: RunPatchResponse = api_post(
         auth,
-        &format!("/api/agents/{}/run/files/patch", connection.cloud_agent_id),
+        &format!(
+            "/api/agents/{}/workspace/files/patch",
+            connection.cloud_agent_id
+        ),
         &json!({ "patch": patch }),
     )
     .await?;
@@ -890,14 +839,15 @@ async fn refresh_tokens(base_url: &str, current: &AuthRecord) -> Result<AuthReco
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ActiveConnection {
+    version: u32,
+    #[serde(rename = "baseUrl")]
+    base_url: String,
     #[serde(rename = "cloudAgentId")]
     cloud_agent_id: String,
     #[serde(rename = "cloudAgentName")]
     cloud_agent_name: String,
-    #[serde(rename = "workspaceId")]
-    workspace_id: Option<String>,
-    #[serde(rename = "sandboxId")]
-    sandbox_id: Option<String>,
+    #[serde(rename = "workspacePath")]
+    workspace_path: String,
     #[serde(rename = "attachedAt")]
     attached_at: u64,
 }
@@ -909,10 +859,28 @@ struct ConnectionStore {
 }
 
 impl ConnectionStore {
-    fn open() -> Result<Self> {
-        let dir = config_dir()?;
+    fn open_for_current_dir() -> Result<Self> {
+        Self::at_dir(std::env::current_dir()?.join(CONNECTION_DIR_NAME))
+    }
+
+    fn find_existing_for_current_dir() -> Result<Option<Self>> {
+        let mut current = std::env::current_dir()?;
+        loop {
+            let dir = current.join(CONNECTION_DIR_NAME);
+            if dir.join(CONNECTION_FILE_NAME).exists() {
+                return Self::at_dir(dir).map(Some);
+            }
+            if !current.pop() {
+                break;
+            }
+        }
+        Ok(None)
+    }
+
+    fn at_dir(dir: PathBuf) -> Result<Self> {
+        fs::create_dir_all(&dir)?;
         Ok(Self {
-            connection_path: dir.join("connection.json"),
+            connection_path: dir.join(CONNECTION_FILE_NAME),
             lock_path: dir.join("connection.lock"),
             in_process: Mutex::new(()),
         })
@@ -1096,15 +1064,13 @@ struct AgentCreateResponse {
 }
 
 #[derive(Debug, Deserialize)]
-struct WorkspaceBootstrapResponse {
-    workspace: Option<WorkspaceResponse>,
+struct WorkspaceConnectResponse {
+    workspace: ConnectedWorkspace,
 }
 
 #[derive(Debug, Deserialize)]
-struct WorkspaceResponse {
-    id: String,
-    #[serde(rename = "sandboxId")]
-    sandbox_id: Option<String>,
+struct ConnectedWorkspace {
+    path: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1153,225 +1119,6 @@ enum RunStreamEvent {
     },
     #[serde(rename = "error")]
     Error { message: String },
-}
-
-#[derive(Debug, Serialize)]
-struct TemplateDescriptor<'a> {
-    id: &'a str,
-    name: &'a str,
-    source: &'a str,
-}
-
-#[derive(Debug, Clone)]
-struct TemplateSummary {
-    id: String,
-    name: String,
-    path: PathBuf,
-    description: String,
-    score: i32,
-}
-
-// ----- Templates ------------------------------------------------------------
-
-fn template_search(query: &str) -> Result<()> {
-    let templates = search_templates(query)?;
-    if templates.is_empty() {
-        println!("No templates found.");
-        return Ok(());
-    }
-    for template in templates {
-        println!(
-            "{}\t{}\t{}",
-            template.id, template.name, template.description
-        );
-    }
-    Ok(())
-}
-
-fn template_inspect(id: &str) -> Result<()> {
-    let template = find_template(id)?;
-    println!("id: {}", template.id);
-    println!("name: {}", template.name);
-    println!("path: {}", template.path.display());
-    println!();
-    println!("{}", read_template_readme(&template.path)?);
-    Ok(())
-}
-
-fn template_apply(id: &str) -> Result<()> {
-    let template = find_template(id)?;
-    let cwd = std::env::current_dir()?;
-    copy_template(&template.path, &cwd)?;
-    let opensteer_dir = cwd.join(".opensteer");
-    fs::create_dir_all(&opensteer_dir)?;
-    fs::write(
-        cwd.join(TEMPLATE_DESCRIPTOR_PATH),
-        format!(
-            "{}\n",
-            serde_json::to_string_pretty(&TemplateDescriptor {
-                id: &template.id,
-                name: &template.name,
-                source: &template.path.display().to_string(),
-            })?
-        ),
-    )?;
-    println!("Applied template {} into {}", template.id, cwd.display());
-    Ok(())
-}
-
-fn search_templates(query: &str) -> Result<Vec<TemplateSummary>> {
-    let query_terms = query_terms(query);
-    let root = template_root()?;
-    let mut templates = Vec::new();
-    for entry in fs::read_dir(&root)? {
-        let entry = entry?;
-        if !entry.file_type()?.is_dir() {
-            continue;
-        }
-        let id = entry.file_name().to_string_lossy().to_string();
-        if !id.ends_with("-pack") {
-            continue;
-        }
-        let path = entry.path();
-        let readme = read_template_readme(&path).unwrap_or_default();
-        let haystack = format!("{id}\n{readme}").to_lowercase();
-        let score = if query_terms.is_empty() {
-            1
-        } else {
-            query_terms
-                .iter()
-                .map(|term| haystack.matches(term).count() as i32)
-                .sum()
-        };
-        if score > 0 {
-            templates.push(TemplateSummary {
-                name: id.trim_end_matches("-pack").replace('-', " "),
-                id,
-                path,
-                description: first_readme_sentence(&readme),
-                score,
-            });
-        }
-    }
-    templates.sort_by(|a, b| b.score.cmp(&a.score).then_with(|| a.id.cmp(&b.id)));
-    Ok(templates)
-}
-
-fn find_template(id: &str) -> Result<TemplateSummary> {
-    let templates = search_templates(id)?;
-    templates
-        .into_iter()
-        .find(|template| template.id == id || template.id.trim_end_matches("-pack") == id)
-        .ok_or_else(|| anyhow!("template not found: {id}"))
-}
-
-fn template_root() -> Result<PathBuf> {
-    if let Ok(value) = std::env::var("OPENSTEER_TEMPLATE_REPO") {
-        let path = PathBuf::from(value);
-        if path.exists() {
-            return Ok(path);
-        }
-    }
-    let local = PathBuf::from("/Users/timjang/Developer/trendup/agent-packs");
-    if local.exists() {
-        return Ok(local);
-    }
-    let mut cwd = std::env::current_dir()?;
-    loop {
-        let candidate = cwd.join("agent-packs");
-        if candidate.exists() {
-            return Ok(candidate);
-        }
-        if !cwd.pop() {
-            break;
-        }
-    }
-    Err(anyhow!(
-        "template repo not found; set OPENSTEER_TEMPLATE_REPO to the agent-packs directory"
-    ))
-}
-
-fn read_template_readme(path: &Path) -> Result<String> {
-    fs::read_to_string(path.join("README.md"))
-        .or_else(|_| fs::read_to_string(path.join("CLAUDE.md")))
-        .with_context(|| format!("template {} has no README.md or CLAUDE.md", path.display()))
-}
-
-fn copy_template(source: &Path, destination: &Path) -> Result<()> {
-    let mut created_dirs = HashSet::new();
-    copy_dir_recursive(source, destination, source, &mut created_dirs)
-}
-
-fn copy_dir_recursive(
-    root: &Path,
-    destination: &Path,
-    current: &Path,
-    created_dirs: &mut HashSet<PathBuf>,
-) -> Result<()> {
-    for entry in fs::read_dir(current)? {
-        let entry = entry?;
-        let path = entry.path();
-        let relative = path.strip_prefix(root)?;
-        if should_skip_template_path(relative) {
-            continue;
-        }
-        let target = destination.join(relative);
-        if entry.file_type()?.is_dir() {
-            if created_dirs.insert(target.clone()) {
-                fs::create_dir_all(&target)?;
-            }
-            copy_dir_recursive(root, destination, &path, created_dirs)?;
-        } else {
-            if let Some(parent) = target.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            fs::copy(&path, &target)
-                .with_context(|| format!("failed to copy {}", relative.display()))?;
-        }
-    }
-    Ok(())
-}
-
-fn should_skip_template_path(path: &Path) -> bool {
-    let text = path.to_string_lossy();
-    if text == ".git"
-        || text.starts_with(".git/")
-        || text == ".local"
-        || text.starts_with(".local/")
-        || text.starts_with("node_modules/")
-        || text.contains("/__pycache__/")
-        || text.ends_with(".pyc")
-        || text.ends_with(".log")
-        || text.ends_with(".db")
-        || text.ends_with(".db-wal")
-        || text.ends_with(".db-shm")
-        || text == ".DS_Store"
-        || text.starts_with(".env")
-        || text == ".claude/scheduled_tasks.lock"
-    {
-        return true;
-    }
-    false
-}
-
-fn query_terms(query: &str) -> Vec<String> {
-    query
-        .split(|c: char| !c.is_alphanumeric())
-        .map(str::trim)
-        .filter(|term| !term.is_empty())
-        .map(|term| term.to_lowercase())
-        .collect()
-}
-
-fn first_readme_sentence(readme: &str) -> String {
-    readme
-        .lines()
-        .find(|line| {
-            let trimmed = line.trim();
-            !trimmed.is_empty() && !trimmed.starts_with('#') && !trimmed.starts_with("```")
-        })
-        .map(|line| line.trim().trim_matches('*').to_string())
-        .unwrap_or_default()
 }
 
 // ----- Misc helpers ---------------------------------------------------------
