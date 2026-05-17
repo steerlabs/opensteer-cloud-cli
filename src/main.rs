@@ -1,4 +1,5 @@
 mod browser_profiles;
+mod claim;
 mod local_browser;
 mod snapshot;
 
@@ -54,6 +55,23 @@ enum Commands {
         #[command(subcommand)]
         command: AgentCommands,
     },
+    /// Claim a pending browser-profile picker session by uploading your local browser cookies.
+    Claim {
+        /// The request ID shown in the cloud workspace picker prompt.
+        request_id: String,
+        /// Local Chromium browser: chrome, chrome-canary, edge, brave, vivaldi, chromium, or helium.
+        #[arg(long)]
+        browser: Option<String>,
+        /// Local Chromium user-data directory.
+        #[arg(long)]
+        user_data_dir: Option<PathBuf>,
+        /// Local Chromium profile directory, such as Default or Profile 2.
+        #[arg(long)]
+        profile_directory: Option<String>,
+        /// Only sync cookies for this domain or subdomains. Repeat for multiple domains.
+        #[arg(long = "domain")]
+        domains: Vec<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -92,7 +110,30 @@ async fn main() -> Result<()> {
             AgentCommands::Open { agent } => agent_open(&agent).await,
             AgentCommands::Rm { agent } => agent_rm(&agent).await,
         },
+        Commands::Claim {
+            request_id,
+            browser,
+            user_data_dir,
+            profile_directory,
+            domains,
+        } => {
+            claim_request(claim::ClaimInput {
+                request_id,
+                browser,
+                user_data_dir,
+                profile_directory,
+                domains,
+            })
+            .await
+        }
     }
+}
+
+async fn claim_request(input: claim::ClaimInput) -> Result<()> {
+    let auth = AuthStore::open()?;
+    let access_token = auth.bearer_token().await?;
+    let exit_code = claim::run_claim(input, auth.base_url(), access_token).await;
+    std::process::exit(exit_code as i32);
 }
 
 // ----- Command handlers ---------------------------------------------------

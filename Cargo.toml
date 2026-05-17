@@ -25,3 +25,4 @@ tokio = { version = "1", features = ["macros", "process", "rt-multi-thread", "ti
 base64 = "0.22"
 tungstenite = "0.28"
 ureq = "3"
+urlencoding = "2"
