@@ -19,6 +19,7 @@ pub enum CliExit {
     UploadFailed = 69,
     CliTooOld = 70,
     ServerError = 71,
+    NotAuthenticated = 72,
 }
 
 pub struct ClaimInput {

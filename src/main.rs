@@ -131,7 +131,15 @@ async fn main() -> Result<()> {
 
 async fn claim_request(input: claim::ClaimInput) -> Result<()> {
     let auth = AuthStore::open()?;
-    let access_token = auth.bearer_token().await?;
+    let access_token = match auth.bearer_token().await {
+        Ok(token) => token,
+        Err(error) => {
+            eprintln!(
+                "error=not_authenticated message=\"{error}\" hint=\"run `opensteer-cloud login`\""
+            );
+            std::process::exit(claim::CliExit::NotAuthenticated as i32);
+        }
+    };
     let exit_code = claim::run_claim(input, auth.base_url(), access_token).await;
     std::process::exit(exit_code as i32);
 }
