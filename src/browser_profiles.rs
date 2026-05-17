@@ -1,18 +1,11 @@
-use crate::local_browser::{
-    BrowserCookie, ReadBrowserCookiesInput, cookie_domain_count, filter_cookie_domains,
-    list_local_profiles, read_browser_cookies,
-};
+use crate::local_browser::list_local_profiles;
+use crate::snapshot::{self, CaptureInput};
 use anyhow::{Context, Result, anyhow, bail};
 use clap::Subcommand;
-use flate2::{Compression, write::GzEncoder};
 use reqwest::StatusCode;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::{Value, json};
-use std::{
-    io::Write,
-    path::PathBuf,
-    time::{Duration, SystemTime, UNIX_EPOCH},
-};
+use std::{path::PathBuf, time::Duration};
 
 const PROFILE_IMPORT_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const PROFILE_IMPORT_TIMEOUT: Duration = Duration::from_secs(5 * 60);
@@ -140,23 +133,6 @@ struct BrowserProfileImportSnapshotSummary {
     cookie_count: u64,
     domain_count: u64,
     cookie_domains: Option<Vec<String>>,
-}
-
-#[derive(Serialize)]
-struct PortableBrowserProfileSnapshot<'a> {
-    version: &'static str,
-    source: PortableBrowserProfileSnapshotSource<'a>,
-    cookies: &'a [BrowserCookie],
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct PortableBrowserProfileSnapshotSource<'a> {
-    browser_family: &'static str,
-    browser_brand: &'a str,
-    capture_method: &'static str,
-    platform: &'static str,
-    captured_at: u64,
 }
 
 struct ProfileApiClient {
@@ -303,43 +279,27 @@ async fn profile_archive(client: &ProfileApiClient, selector: &str) -> Result<()
 
 async fn profile_sync(client: &ProfileApiClient, input: SyncCommandInput) -> Result<()> {
     let profile = resolve_profile(client, &input.profile).await?;
-    let read = read_browser_cookies(ReadBrowserCookiesInput {
+    let captured = snapshot::capture(CaptureInput {
         browser: input.browser,
         user_data_dir: input.user_data_dir,
         profile_directory: input.profile_directory,
+        domains: input.domains,
     })?;
-    let cookies = filter_cookie_domains(read.cookies, &input.domains);
-    if cookies.is_empty() {
-        bail!("no syncable cookies found for the selected local browser profile and domain scope");
-    }
-    let domain_count = cookie_domain_count(&cookies);
-    let snapshot = PortableBrowserProfileSnapshot {
-        version: "portable-cookies-v1",
-        source: PortableBrowserProfileSnapshotSource {
-            browser_family: "chromium",
-            browser_brand: read.brand.id_text,
-            capture_method: "sqlite",
-            platform: platform_name(),
-            captured_at: now_millis(),
-        },
-        cookies: &cookies,
-    };
-    let payload = gzip_json(&snapshot)?;
     let created: BrowserProfileImportCreateResponse = client
         .post(
             "/api/browser-profiles/imports",
             json!({ "profileId": profile.profile_id }),
         )
         .await?;
-    if payload.len() as u64 > created.max_upload_bytes {
+    if captured.payload.len() as u64 > created.max_upload_bytes {
         bail!(
             "profile snapshot is {} bytes after gzip, above the {} byte upload limit",
-            payload.len(),
+            captured.payload.len(),
             created.max_upload_bytes
         );
     }
     let uploaded: BrowserProfileImportDescriptor =
-        client.put_bytes(&created.upload_url, payload).await?;
+        client.put_bytes(&created.upload_url, captured.payload).await?;
     let imported = if uploaded.status == "ready" {
         uploaded
     } else {
@@ -355,21 +315,21 @@ async fn profile_sync(client: &ProfileApiClient, input: SyncCommandInput) -> Res
     }
     println!(
         "source: browser={} profile={} userDataDir={}",
-        read.brand.id_text,
-        read.profile_directory,
-        read.user_data_dir.display()
+        captured.brand_id,
+        captured.profile_directory,
+        captured.user_data_dir.display()
     );
     println!(
         "cookies: {}",
         summary
             .map(|summary| summary.cookie_count)
-            .unwrap_or(cookies.len() as u64)
+            .unwrap_or(captured.cookies.len() as u64)
     );
     println!(
         "domains: {}",
         summary
             .map(|summary| summary.domain_count)
-            .unwrap_or(domain_count as u64)
+            .unwrap_or(captured.domain_count as u64)
     );
     if let Some(domains) = summary.and_then(|summary| summary.cookie_domains.as_ref())
         && !domains.is_empty()
@@ -482,15 +442,6 @@ async fn wait_for_import(
     }
 }
 
-fn gzip_json<T: Serialize>(value: &T) -> Result<Vec<u8>> {
-    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
-    serde_json::to_writer(&mut encoder, value)?;
-    encoder.flush()?;
-    encoder
-        .finish()
-        .context("failed to gzip browser profile snapshot")
-}
-
 fn format_profile_row(profile: &BrowserProfileDescriptor) -> String {
     format!(
         "{}\t{}\t{}\tcookies={}\tdomains={}",
@@ -500,25 +451,6 @@ fn format_profile_row(profile: &BrowserProfileDescriptor) -> String {
         profile.cookie_count.unwrap_or(0),
         profile.domain_count.unwrap_or(0)
     )
-}
-
-fn platform_name() -> &'static str {
-    if cfg!(target_os = "macos") {
-        "macos"
-    } else if cfg!(target_os = "windows") {
-        "windows"
-    } else if cfg!(target_os = "linux") {
-        "linux"
-    } else {
-        std::env::consts::OS
-    }
-}
-
-fn now_millis() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_millis() as u64)
-        .unwrap_or(0)
 }
 
 fn encode_query_value(value: &str) -> String {

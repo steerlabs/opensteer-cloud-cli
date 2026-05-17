@@ -1,5 +1,6 @@
 mod browser_profiles;
 mod local_browser;
+mod snapshot;
 
 use anyhow::{Context, Result, anyhow};
 use base64::Engine;
@@ -22,6 +23,7 @@ const DEFAULT_BASE_URL: &str = "https://opensteer.com";
 const ACCESS_TOKEN_LEEWAY_SECS: u64 = 30;
 const CONNECTION_DIR_NAME: &str = ".opensteer-cloud";
 const CONNECTION_FILE_NAME: &str = "connection.json";
+const OPENSTEER_CLOUD_SKILL: &str = include_str!("../SKILL.md");
 
 #[derive(Parser)]
 #[command(name = "opensteer-cloud")]
@@ -39,6 +41,10 @@ enum Commands {
     Whoami,
     Attach {
         agent: String,
+    },
+    Skills {
+        #[command(subcommand)]
+        command: SkillCommands,
     },
     Profiles {
         #[command(subcommand)]
@@ -58,6 +64,11 @@ enum AgentCommands {
     Rm { agent: String },
 }
 
+#[derive(Subcommand)]
+enum SkillCommands {
+    Install,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     if is_opensteer_run_invocation() {
@@ -71,6 +82,9 @@ async fn main() -> Result<()> {
         Commands::Logout => logout().await,
         Commands::Whoami => whoami().await,
         Commands::Attach { agent } => attach(&agent).await,
+        Commands::Skills { command } => match command {
+            SkillCommands::Install => install_skills(),
+        },
         Commands::Profiles { command } => profiles(command).await,
         Commands::Agent { command } => match command {
             AgentCommands::Create { prompt } => agent_create(&prompt.join(" ")).await,
@@ -262,6 +276,15 @@ async fn attach(agent_selector: &str) -> Result<()> {
     println!("Attached to {} ({})", agent.name, agent.id);
     println!("Workspace: {workspace_path}");
     println!("Run: opensteer-run ls .");
+    Ok(())
+}
+
+fn install_skills() -> Result<()> {
+    let home = dirs::home_dir().ok_or_else(|| anyhow!("home directory not found"))?;
+    for target in skill_target_paths(&home) {
+        atomic_write_file(&target, OPENSTEER_CLOUD_SKILL.as_bytes(), 0o644)?;
+        println!("installed {}", target.display());
+    }
     Ok(())
 }
 
@@ -952,26 +975,27 @@ fn open_lock_file(path: &Path) -> std::io::Result<File> {
 }
 
 fn atomic_write_json<T: Serialize>(target: &Path, value: &T) -> std::io::Result<()> {
+    let mut body = serde_json::to_string_pretty(value)
+        .map_err(|e| std::io::Error::new(ErrorKind::InvalidData, e))?;
+    body.push('\n');
+    atomic_write_file(target, body.as_bytes(), 0o600)
+}
+
+fn atomic_write_file(target: &Path, bytes: &[u8], mode: u32) -> std::io::Result<()> {
     let parent = target
         .parent()
         .ok_or_else(|| std::io::Error::new(ErrorKind::InvalidInput, "target path has no parent"))?;
     fs::create_dir_all(parent)?;
 
     let mut tmp = NamedTempFile::new_in(parent)?;
-    let body = serde_json::to_string_pretty(value)
-        .map_err(|e| std::io::Error::new(ErrorKind::InvalidData, e))?;
-    {
-        use std::io::Write;
-        tmp.as_file_mut().write_all(body.as_bytes())?;
-        tmp.as_file_mut().write_all(b"\n")?;
-        tmp.as_file_mut().sync_all()?;
-    }
+    tmp.as_file_mut().write_all(bytes)?;
+    tmp.as_file_mut().sync_all()?;
 
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         tmp.as_file()
-            .set_permissions(fs::Permissions::from_mode(0o600))?;
+            .set_permissions(fs::Permissions::from_mode(mode))?;
     }
 
     tmp.persist(target).map_err(|e| e.error)?;
@@ -1152,9 +1176,36 @@ fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
 
+fn skill_target_paths(home: &Path) -> [PathBuf; 3] {
+    [
+        home.join(".codex/skills/opensteer-cloud/SKILL.md"),
+        home.join(".claude/skills/opensteer-cloud/SKILL.md"),
+        home.join(".agents/skills/opensteer-cloud/SKILL.md"),
+    ]
+}
+
 fn now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn skill_targets_match_supported_agent_skill_roots() {
+        let home = Path::new("/home/alice");
+
+        assert_eq!(
+            skill_target_paths(home),
+            [
+                PathBuf::from("/home/alice/.codex/skills/opensteer-cloud/SKILL.md"),
+                PathBuf::from("/home/alice/.claude/skills/opensteer-cloud/SKILL.md"),
+                PathBuf::from("/home/alice/.agents/skills/opensteer-cloud/SKILL.md"),
+            ]
+        );
+    }
 }
