@@ -23,6 +23,7 @@ SQLite databases, logs, and artifacts.
 ```bash
 opensteer-cloud whoami
 opensteer-cloud agent list
+opensteer-cloud skills install
 opensteer-cloud attach <name-or-id>
 opensteer-run ls .
 opensteer-run read skills/SKILL.md

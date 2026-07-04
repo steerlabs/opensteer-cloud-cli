@@ -35,6 +35,7 @@ curl -fsSL https://opensteer.com/cloud-cli/install.sh | OPENSTEER_CLOUD_VERSION=
 opensteer-cloud --version
 opensteer-cloud login
 opensteer-cloud whoami
+opensteer-cloud skills install
 opensteer-cloud agent create "linkedin sales"
 opensteer-cloud agent list
 opensteer-cloud attach <agent>

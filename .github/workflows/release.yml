@@ -70,7 +70,7 @@ jobs:
           mkdir -p "$staging" release-assets
           cp "target/${target}/release/opensteer-cloud" "$staging/"
           cp "target/${target}/release/opensteer-run" "$staging/"
-          cp README.md LICENSE "$staging/"
+          cp README.md LICENSE SKILL.md "$staging/"
           tar -C "$staging" -czf "release-assets/${archive}" .
           cd release-assets
           if command -v sha256sum >/dev/null 2>&1; then
